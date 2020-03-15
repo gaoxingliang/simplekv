@@ -1,6 +1,6 @@
 package perf;
 
-import bbbb.Bitcask;
+import bitcask.Bitcask;
 import store.KVStore;
 
 import java.io.File;
