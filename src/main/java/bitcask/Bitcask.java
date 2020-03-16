@@ -9,33 +9,38 @@ import store.WrappedBytes;
 
 import java.io.File;
 import java.io.FileNotFoundException;
-import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 public class Bitcask implements KVStore {
+    private static Logger LOG = LogManager.getLogger(Bitcask.class);
+
     private ReentrantReadWriteLock mu = new ReentrantReadWriteLock(true);
     private Lock wlock = mu.writeLock();
     private Lock rlock = mu.writeLock();
-    private DataFile curr;
-    TreeMap<WrappedBytes, Item> trieMap = new TreeMap();
-    Indexer indexer = new Indexer();
+    private MemTable currentMemTable;
+    private MemTable transactionalMemTable;
+    private final AtomicBoolean memTable2DataSubmited = new AtomicBoolean(false);
+
+    private DataFile walFile;
     private File path;
-    private File tempDir;
-    private File indexFile;
 
     private TreeMap<Integer, DataFile> dataFilesMap = new TreeMap<>();
 
     private Metrics metrics = new Metrics();
-    private static Logger LOG = LogManager.getLogger(Bitcask.class);
 
+    private ScheduledExecutorService coExecutor;
     @Override
     public void open() throws Exception {
         long startLoad = System.currentTimeMillis();
@@ -45,33 +50,51 @@ public class Bitcask implements KVStore {
             throw new IllegalStateException("Fail to create " + pathString);
         }
         this.path = basepath;
-        tempDir = new File(path, "temp");
-        if (!tempDir.exists()) {
-            tempDir.mkdirs();
-        }
-        makeSureIndexFile();
+
         /***
          * load all files
          */
         wlock.lock();
         try {
             dataFilesMap = _loadDataFiles();
-            trieMap = loadIndex(dataFilesMap);
-            int lastId = dataFilesMap.isEmpty() ? 0 : dataFilesMap.lastKey();
-            curr = new DataFile(new File(path, newDataFileNameById(lastId + 1)), lastId + 1, false);
+            currentMemTable = new MemTable();
+            // load wal logs'
+            createWALFile(false);
+            loadWAL2Mem();
         }
         finally {
             wlock.unlock();
         }
         LOG.info("Finished loading cost time={}ms, indexMapCount={}, fileCount={}", System.currentTimeMillis() - startLoad,
-                trieMap.size(), dataFilesMap.size());
-        startCompactor();
+                currentMemTable.size(), dataFilesMap.size());
+        startCO();
+    }
+
+    private void loadWAL2Mem() throws Exception  {
+        Entry en = null;
+        while ((en = walFile.readNext()) != null) {
+            currentMemTable.put(en.key, en.value);
+        }
+    }
+
+    private void createWALFile(boolean recreate) throws Exception {
+        if (recreate && walFile != null) {
+            walFile.close();
+            walFile.file.delete();
+        }
+        File wal = new File(path, "wal.log");
+        if (!wal.exists()) {
+            wal.createNewFile();
+        }
+        walFile = new DataFile(wal, -1, false);
     }
 
 
-    private void startCompactor() {
-        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(()-> checkAndCompactIfPossible(), 10, 60, TimeUnit.SECONDS);
+    private void startCO() {
+        coExecutor = Executors.newSingleThreadScheduledExecutor();
+        coExecutor.scheduleAtFixedRate(() -> checkAndCompactIfPossible(), 10, 60, TimeUnit.SECONDS);
     }
+
     private void checkAndCompactIfPossible() {
         List<DataFile> ops;
         synchronized (dataFilesMap) {
@@ -92,37 +115,23 @@ public class Bitcask implements KVStore {
         }
         try {
             long startCompact = System.currentTimeMillis();
-            Pair<DataFile, TreeMap<WrappedBytes, Entry>> pair = Compactor.compact(tempDir, ops);
-            DataFile tempcomapctFile = pair.l;
-            TreeMap<WrappedBytes, Entry> tempMap = pair.r;
+            DataFile tempcomapctFile = Compactor.compact(ops.get(0).file.getParentFile(), ops);
             LOG.info("Finished compact, cost={}ms, file={}", tempcomapctFile.file.getName());
             synchronized (dataFilesMap) {
-                ops.forEach(op -> {
-                    DataFile oldFile = dataFilesMap.remove(op.id);
+                ops.stream().map(o -> dataFilesMap.get(o.id)).forEach(oldFile -> {
                     try {
                         oldFile.close();
                         oldFile.file.delete();
+                        Optional.ofNullable(oldFile.indexFile).ifPresent(o -> o.delete());
+                        dataFilesMap.remove(oldFile.id);
                     }
                     catch (Exception e) {
                         e.printStackTrace();
                     }
                 });
-                int newId = ops.get(ops.size() - 1).id; // 最后一个的id
-                File newFile = new File(path, newDataFileNameById(newId));
-                tempcomapctFile.file.renameTo(newFile);
-                dataFilesMap.put(newId, new DataFile(newFile, newId, true));
-                /**
-                 * rebuild index map
-                 */
-                synchronized (trieMap) {
-                    tempMap.values().forEach(e -> {
-                        trieMap.put(e.key, new Item(newId, e.offset, e.key.bytes.length, e.value.length, e.key.bytes));
-                    });
-                }
-
-                // !todo index file?
+                dataFilesMap.put(tempcomapctFile.id, tempcomapctFile);
             }
-            LOG.info("Index map is rebuild");
+            LOG.info("Index map is rebuild, costTime={}ms for {} files", System.currentTimeMillis() - startCompact, ops.size());
         }
         catch (Exception e) {
             LOG.error("Fail to compact", e);
@@ -135,44 +144,21 @@ public class Bitcask implements KVStore {
         TreeMap<Integer, DataFile> map = new TreeMap<>();
         fileList.stream().map(f -> {
             try {
-                return new DataFile(f, parseIdFromDataFile(f.getName()), true);
+                return new DataFile(f, DataFile.parseIdFromDataFile(f.getName()), true);
             }
             catch (FileNotFoundException e) {
                 throw new IllegalStateException(e);
             }
-        }).sorted(Comparator.comparingInt(d -> d.id)).forEach(d -> map.put(d.id, d));
-        return map;
-    }
-
-    private DataFile newDataFile(File path, int id, boolean readonly) throws FileNotFoundException {
-        return new DataFile(path, id, readonly);
-    }
-
-    private int parseIdFromDataFile(String fileName) {
-        return Integer.valueOf(fileName.substring(0, fileName.length() - ".data".length()));
-    }
-
-    private String newDataFileNameById(int id) {
-        return id + ".data";
-    }
-
-    private TreeMap loadIndex(TreeMap<Integer, DataFile> dataFiles) throws Exception {
-        File indexFile = new File(path, "index");
-        if (!indexFile.exists()) {
-            // 读取每个文件的第一个
-            TreeMap<WrappedBytes, Item> t = new TreeMap<>();
-            for (DataFile d : dataFiles.values()) {
-                Entry e = null;
-                while ((e = d.readNext()) != null) {
-                    // int fileId, long offset, int klen, int vlen, byte[] key
-                    t.put(e.key, new Item(d.id, e.offset, e.key.bytes.length, e.value.length, e.key.bytes));
-                }
+        }).sorted(Comparator.comparingInt(d -> d.id)).forEach(d -> {
+            map.put(d.id, d);
+            try {
+                d.indexMap = SparseIndexBuilder.buildIndexFileIfNotExists(d, true);
             }
-            return t;
-        }
-        else {
-            return indexer.load(indexFile.getAbsolutePath());
-        }
+            catch (Exception e) {
+                LOG.error("Fail to build index file - {}", d.file, e);
+            }
+        });
+        return map;
     }
 
     public byte[] get(byte[] k) throws Exception {
@@ -180,26 +166,28 @@ public class Bitcask implements KVStore {
         boolean got = false;
         rlock.lock();
         try {
-            Item item;
-            synchronized (trieMap) {
-                 item = trieMap.get(new WrappedBytes(k));
-            }
-            if (item == null) {
-                return null;
-            }
-            Entry en;
-            if (item.fileId == curr.id) {
-                en = curr.readAt(item.offset);
-            }
-            else {
-                DataFile f;
-                synchronized (dataFilesMap) {
-                    f = dataFilesMap.get(item.fileId);
+            byte [] v = currentMemTable.get(k);
+            // 可能有一个new dump的task
+
+            if (v == null) {
+                v = transactionalMemTable.get(k);
+                if (v == null) {
+                    // 从最后往最前
+                    List<DataFile> list = new ArrayList<>();
+                    synchronized (dataFilesMap) {
+                        list.addAll(dataFilesMap.values());
+                    }
+                    for (int j = list.size() - 1; j > 0; j--) {
+                        DataFile cur = list.get(j);
+                        v = cur.search(k);
+                        if (v != null) {
+                            break;
+                        }
+                    }
                 }
-                en = f.readAt(item.offset);
             }
-            got = en != null;
-            return en == null ? null : en.value;
+            got = v != null;
+            return v;
         }
         finally {
             rlock.unlock();
@@ -212,23 +200,16 @@ public class Bitcask implements KVStore {
         return metrics;
     }
 
-    private void makeSureIndexFile() throws IOException {
-        indexFile = new File(path, "index");
-        if (!indexFile.exists()) {
-            indexFile.createNewFile();
-        }
-    }
-
 
     @Override
     public void close() throws Exception {
         wlock.lock();
         try {
-            curr.close();
             for (DataFile d : dataFilesMap.values()) {
                 d.close();
             }
-            indexer.save(trieMap, indexFile.getAbsolutePath());
+            coExecutor.shutdown();
+            coExecutor.awaitTermination(1, TimeUnit.MINUTES);
         }
         finally {
             wlock.unlock();
@@ -236,30 +217,59 @@ public class Bitcask implements KVStore {
     }
 
     public void put(byte[] k, byte[] v) throws Exception {
+        //LOG.debug("Start puting k={}", new String(k));
         long startNano = System.nanoTime();
         wlock.lock();
         try {
-            long s = curr.size();
-            if (s > Config.FREEZE_THRESHOLD) {
-                curr.close();
-                int id = curr.id;
-                DataFile freeze = newDataFile(curr.file, id, true);
-                synchronized (dataFilesMap) {
-                    dataFilesMap.put(id, freeze);
-                }
-                curr = newDataFile(new File(path, newDataFileNameById(id + 1)), id + 1, false);
-            }
-            WrappedBytes kb = new WrappedBytes(k);
-            long offset = curr.write(new Entry(kb, v));
-            // int fileId, long offset, int klen, int vlen, byte[] key
-            synchronized (trieMap) {
-                trieMap.put(kb, new Item(curr.id, offset, kb.bytes.length, v.length, kb.bytes));
+            walFile.write(new Entry(WrappedBytes.of(k), v));
+            currentMemTable.put(k, v);
+            if (currentMemTable.needDump() && memTable2DataSubmited.compareAndSet(false, true)) {
+                MemTable newMem = new MemTable();
+                transactionalMemTable = currentMemTable;
+                currentMemTable = newMem;
+                submitNewDumpTask(transactionalMemTable);
             }
         }
         finally {
             wlock.unlock();
         }
         metrics.flagPut(System.nanoTime() - startNano);
+    }
+
+
+    private void submitNewDumpTask(MemTable memTable) throws Exception {
+        coExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                LOG.info("Current memtable need to dump");
+                // let's dump now
+                int newId = 0;
+                try {
+                    synchronized (dataFilesMap) {
+                        newId = dataFilesMap.isEmpty() ? 0 : dataFilesMap.lastKey() + Config.FILE_STEP;
+                    }
+                    File newFile = new File(path, DataFile.newDataFileNameById(newId));
+                    newFile.createNewFile();
+                    DataFile newDataFile = DataFile.newDataFile(newFile, newId, false);
+                    memTable.dump2File(newDataFile);
+                    newDataFile.close();
+                    newDataFile = DataFile.newDataFile(newFile, newId, true);
+                    newDataFile.indexMap = SparseIndexBuilder.buildIndexFileIfNotExists(newDataFile, true);
+
+                    synchronized (dataFilesMap) {
+                        dataFilesMap.put(newId, newDataFile);
+                    }
+                    // 清理WAL
+                    createWALFile(true);
+                    memTable.clear();
+                } catch (Exception e) {
+                    LOG.error("Fail to dump to new data file", e);
+                } finally {
+                    memTable2DataSubmited.set(false);
+                }
+            }
+        });
+
     }
 
 }

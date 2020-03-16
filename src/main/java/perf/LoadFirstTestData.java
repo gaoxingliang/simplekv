@@ -47,6 +47,7 @@ public class LoadFirstTestData {
             b.get(vs, 0, vlen);
             s.put(Arrays.copyOfRange(ks, 0, klen), Arrays.copyOfRange(vs, 0, vlen));
             if (++k  % 10000 == 0) {
+                System.out.println("has loaded records count ======" + k);
                 kvs.add(Arrays.copyOfRange(ks, 0, klen));
                 kvs.add(Arrays.copyOfRange(vs, 0, vlen));
             }

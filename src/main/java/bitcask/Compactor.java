@@ -1,11 +1,11 @@
 package bitcask;
 
+import config.Config;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import store.WrappedBytes;
 
 import java.io.File;
-import java.util.Iterator;
 import java.util.List;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -14,8 +14,17 @@ class Compactor {
     private static Logger LOG = LogManager.getLogger(Compactor.class);
 
     private static final AtomicInteger compactId = new AtomicInteger(0);
-    public static Pair<DataFile, TreeMap<WrappedBytes, Entry>> compact(File tempFolder, List<DataFile> operateFiles) throws Exception {
-        DataFile temp = new DataFile(new File(tempFolder, compactId.incrementAndGet() + ""), Integer.MAX_VALUE, false);
+
+    /**
+     * compact输入文件
+     * @param dataDir  目标文件夹
+     * @param operateFiles  待compact文件   会关闭该文件
+     * @return 返回一个临时的DataFile  已关闭
+     * @throws Exception
+     */
+    public static DataFile compact(File dataDir, List<DataFile> operateFiles) throws Exception {
+        DataFile lastDataFile = operateFiles.get(operateFiles.size() - 1);
+        DataFile temp = new DataFile(new File(dataDir, DataFile.newDataFileNameById(lastDataFile.id + Config.FILE_STEP - 1)), Integer.MAX_VALUE, false);
         TreeMap<WrappedBytes, Entry> treeMap = new TreeMap<>();
         Entry en = null;
         for (DataFile d : operateFiles) {
@@ -26,15 +35,9 @@ class Compactor {
             }
             d.close();
         }
-        Iterator<Entry> it = treeMap.values().iterator();
-        long offset = 0;
-        while (it.hasNext()) {
-            en = it.next();
-            en.offset = offset;
-            temp.write(en);
-            offset += en.writeSize();
-        }
-        temp.close();
-        return new Pair<>(temp, treeMap);
+        temp.writeMap(treeMap);
+        temp.setIndexMap(SparseIndexBuilder.buildIndexFileIfNotExists(temp, true));
+        return temp;
     }
+
 }

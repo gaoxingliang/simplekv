@@ -47,4 +47,9 @@ public class WrappedBytes implements Comparable<WrappedBytes>{
     public String toString() {
         return new String(bytes);
     }
+
+
+    public static WrappedBytes of(byte [] b) {
+        return new WrappedBytes(b);
+    }
 }
