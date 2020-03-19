@@ -1,5 +1,7 @@
 package bitcask;
 
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnels;
 import config.Config;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -32,7 +34,7 @@ public class Bitcask implements KVStore {
     private MemTable currentMemTable;
     private MemTable transactionalMemTable;
     private final AtomicBoolean memTable2DataSubmited = new AtomicBoolean(false);
-
+    private final BloomFilter<byte[]> filter = BloomFilter.create(Funnels.byteArrayFunnel(), 1000000, 0.001);
     private DataFile walFile;
     private File path;
 
@@ -164,6 +166,11 @@ public class Bitcask implements KVStore {
     public byte[] get(byte[] k) throws Exception {
         long startNano = System.nanoTime();
         boolean got = false;
+        if (!filter.mightContain(k)) {
+            metrics.flagGet(got, System.nanoTime() - startNano);
+            return null;
+        }
+
         rlock.lock();
         try {
             byte [] v = currentMemTable.get(k);
@@ -225,6 +232,7 @@ public class Bitcask implements KVStore {
         try {
             walFile.write(new Entry(WrappedBytes.of(k), v));
             currentMemTable.put(k, v);
+            filter.put(k);
             if (currentMemTable.needDump() && memTable2DataSubmited.compareAndSet(false, true)) {
                 MemTable newMem = new MemTable();
                 transactionalMemTable = currentMemTable;

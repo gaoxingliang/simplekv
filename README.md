@@ -1,7 +1,8 @@
 # simplekv
 一个简单的基于sstable的kvstore. 基本想法: <br>
- 有一个MemTable来存储当前的写入,  到达一定阈值后将MemTable转为SSTable文件并构建索引文件. <br>
- 系统维护一个稀疏索引的内存对象来快速定位某个key所在的文件. <br>
+1. 有一个MemTable来存储当前的写入,  到达一定阈值后将MemTable转为SSTable文件并构建索引文件. <br>
+2. 系统维护一个稀疏索引的内存对象来快速定位某个key所在的文件. <br>
+3. 使用bloom filter来加速判断. <br> 
 
 # 怎么使用?
 参考[Test.java](./src/test/java/Test.java) 
