@@ -170,7 +170,9 @@ public class Bitcask implements KVStore {
             // 可能有一个new dump的task
 
             if (v == null) {
-                v = transactionalMemTable.get(k);
+                if (transactionalMemTable != null) {
+                    v = transactionalMemTable.get(k);
+                }
                 if (v == null) {
                     // 从最后往最前
                     List<DataFile> list = new ArrayList<>();
